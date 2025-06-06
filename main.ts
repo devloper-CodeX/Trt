@@ -48,7 +48,7 @@ async function checkAdminAuth(request: Request): Promise<Response | null> {
         status: 302,
         headers: {
           'Location': `/${userID}`,
-          'Set-Cookie': `admin_session=${sessionId}; Path=/; Max-Age=3600`
+          'Set-Cookie': `admin_session=${sessionId}; Path=/; Max-Age=3600; SameSite=Strict; Secure`
         }
       });
       return response;
@@ -140,16 +140,23 @@ if (!isValidUUID(userID)) {
 console.log(Deno.version);
 console.log(`Final UUID in use: ${userID}`);
 
-Deno.serve(async (request: Request) => {
-  const authResponse = await checkAdminAuth(request);
-  if (authResponse) return authResponse;
+// تحسينات للأداء
+const TCP_KEEPALIVE_INTERVAL = 30 * 1000; // 30 ثانية
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 1000; // 1 ثانية
 
-  const upgrade = request.headers.get('upgrade') || '';
-  if (upgrade.toLowerCase() != 'websocket') {
-    const url = new URL(request.url);
-    switch (url.pathname) {
-      case '/': {
-        const htmlContent = `
+Deno.serve({
+  port: 443,
+  handler: async (request: Request) => {
+    const authResponse = await checkAdminAuth(request);
+    if (authResponse) return authResponse;
+
+    const upgrade = request.headers.get('upgrade') || '';
+    if (upgrade.toLowerCase() != 'websocket') {
+      const url = new URL(request.url);
+      switch (url.pathname) {
+        case '/': {
+          const htmlContent = `
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -184,13 +191,13 @@ Deno.serve(async (request: Request) => {
 </body>
 </html>
         `;
-        return new Response(htmlContent, {
-          headers: { 'Content-Type': 'text/html; charset=utf-8' },
-        });
-      }
-      
-      case '/admin-login': {
-        const loginHtml = `
+          return new Response(htmlContent, {
+            headers: { 'Content-Type': 'text/html; charset=utf-8' },
+          });
+        }
+        
+        case '/admin-login': {
+          const loginHtml = `
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -249,20 +256,20 @@ Deno.serve(async (request: Request) => {
 </body>
 </html>
         `;
-        return new Response(loginHtml, {
-          headers: { 'Content-Type': 'text/html; charset=utf-8' },
-        });
-      }
-      
-      case `/${userID}`: {
-        const hostName = url.hostname;
-        const port = url.port || (url.protocol === 'https:' ? 443 : 80);
-        const vlessMain = `vless://${userID}@${hostName}:${port}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2048#${credit}`;      
-        const ck = `vless://${userID}\u0040${hostName}:443?encryption=none%26security=tls%26sni=${hostName}%26fp=randomized%26type=ws%26host=${hostName}%26path=%2F%3Fed%3D2048%23${credit}`;
-        const urlString = `https://deno-proxy-version.deno.dev/?check=${ck}`;
-        await fetch(urlString);
+          return new Response(loginHtml, {
+            headers: { 'Content-Type': 'text/html; charset=utf-8' },
+          });
+        }
+        
+        case `/${userID}`: {
+          const hostName = url.hostname;
+          const port = url.port || (url.protocol === 'https:' ? 443 : 80);
+          const vlessMain = `vless://${userID}@${hostName}:${port}?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2048#${credit}`;      
+          const ck = `vless://${userID}\u0040${hostName}:443?encryption=none%26security=tls%26sni=${hostName}%26fp=randomized%26type=ws%26host=${hostName}%26path=%2F%3Fed%3D2048%23${credit}`;
+          const urlString = `https://deno-proxy-version.deno.dev/?check=${ck}`;
+          await fetch(urlString);
 
-        const clashMetaConfig = `
+          const clashMetaConfig = `
 - type: vless
   name: ${hostName}
   server: ${hostName}
@@ -279,7 +286,7 @@ Deno.serve(async (request: Request) => {
       host: ${hostName}
 `;
 
-        const htmlConfigContent = `
+          const htmlConfigContent = `
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -354,62 +361,63 @@ Deno.serve(async (request: Request) => {
 </body>
 </html>
 `;
-        return new Response(htmlConfigContent, {
-          status: 200,
-          headers: {
-            'Content-Type': 'text/html; charset=utf-8',
-          },
-        });
+          return new Response(htmlConfigContent, {
+            status: 200,
+            headers: {
+              'Content-Type': 'text/html; charset=utf-8',
+            },
+          });
+        }
+        default:
+          return new Response('Not found', { status: 404 })
       }
-      default:
-        return new Response('Not found', { status: 404 })
+    } else {
+      return await vlessOverWSHandler(request)
     }
-  } else {
-    return await vlessOverWSHandler(request)
+  },
+  onListen: () => {
+    console.log('Server started with high performance optimizations');
   }
-})
+});
 
 async function vlessOverWSHandler(request: Request) {
-  const { socket, response } = Deno.upgradeWebSocket(request)
-  let address = ''
-  let portWithRandomLog = ''
+  const { socket, response } = Deno.upgradeWebSocket(request);
+  let address = '';
+  let portWithRandomLog = '';
   const log = (info: string, event = '') => {
-    console.log(`[${address}:${portWithRandomLog}] ${info}`, event)
-  }
-  const earlyDataHeader = request.headers.get('sec-websocket-protocol') || ''
+    console.log(`[${address}:${portWithRandomLog}] ${info}`, event);
+  };
   
-  // تحسين: استخدام TransformStream لمعالجة البيانات بكفاءة
-  const transformStream = new TransformStream({
-    transform(chunk, controller) {
-      controller.enqueue(chunk);
-    }
-  });
-  
-  const readableWebSocketStream = makeReadableWebSocketStream(socket, earlyDataHeader, log)
+  const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
+  const readableWebSocketStream = makeReadableWebSocketStream(socket, earlyDataHeader, log);
   let remoteSocketWapper: any = {
     value: null,
-  }
-  let udpStreamWrite: any = null
-  let isDns = false
+  };
+  let udpStreamWrite: any = null;
+  let isDns = false;
 
-  // تحسين: استخدام pipeThrough لتحسين تدفق البيانات
+  // Set timeout for WebSocket connection
+  const timeoutId = setTimeout(() => {
+    log('WebSocket connection timeout');
+    safeCloseWebSocket(socket);
+  }, 30000); // 30 seconds timeout
+
+  socket.addEventListener('close', () => {
+    clearTimeout(timeoutId);
+  });
+
   readableWebSocketStream
-    .pipeThrough(transformStream)
     .pipeTo(
       new WritableStream({
         async write(chunk, controller) {
           if (isDns && udpStreamWrite) {
-            return udpStreamWrite(chunk)
+            return udpStreamWrite(chunk);
           }
-          
-          // تحسين: تقليل عمليات النسخ للبيانات
-          const chunkView = new Uint8Array(chunk);
-          
           if (remoteSocketWapper.value) {
-            const writer = remoteSocketWapper.value.writable.getWriter()
-            await writer.write(chunkView)
-            writer.releaseLock()
-            return
+            const writer = remoteSocketWapper.value.writable.getWriter();
+            await writer.write(new Uint8Array(chunk));
+            writer.releaseLock();
+            return;
           }
 
           const {
@@ -420,33 +428,30 @@ async function vlessOverWSHandler(request: Request) {
             rawDataIndex,
             vlessVersion = new Uint8Array([0, 0]),
             isUDP,
-          } = processVlessHeader(chunkView, userID)
-          address = addressRemote
-          portWithRandomLog = `${portRemote}--${Math.random()} ${isUDP ? 'udp ' : 'tcp '} `
-          
+          } = processVlessHeader(chunk, userID);
+          address = addressRemote;
+          portWithRandomLog = `${portRemote}--${Math.random()} ${isUDP ? 'udp ' : 'tcp '} `;
           if (hasError) {
-            throw new Error(message)
+            throw new Error(message);
           }
-          
           if (isUDP) {
             if (portRemote === 53) {
-              isDns = true
+              isDns = true;
             } else {
-              throw new Error('UDP proxy only enable for DNS which is port 53')
+              throw new Error('UDP proxy only enable for DNS which is port 53');
             }
           }
           
-          const vlessResponseHeader = new Uint8Array([vlessVersion[0], 0])
-          const rawClientData = chunkView.subarray(rawDataIndex)
+          const vlessResponseHeader = new Uint8Array([vlessVersion[0], 0]);
+          const rawClientData = chunk.slice(rawDataIndex);
 
           if (isDns) {
-            const { write } = await handleUDPOutBound(socket, vlessResponseHeader, log)
-            udpStreamWrite = write
-            udpStreamWrite(rawClientData)
-            return
+            const { write } = await handleUDPOutBound(socket, vlessResponseHeader, log);
+            udpStreamWrite = write;
+            udpStreamWrite(rawClientData);
+            return;
           }
           
-          // تحسين: استخدام اتصال TCP أكثر كفاءة
           await handleTCPOutBound(
             remoteSocketWapper,
             addressRemote,
@@ -455,24 +460,24 @@ async function vlessOverWSHandler(request: Request) {
             socket,
             vlessResponseHeader,
             log
-          )
+          );
         },
         close() {
-          log(`readableWebSocketStream is close`)
+          log(`readableWebSocketStream is close`);
         },
         abort(reason) {
-          log(`readableWebSocketStream is abort`, JSON.stringify(reason))
+          log(`readableWebSocketStream is abort`, JSON.stringify(reason));
         },
       })
     )
     .catch((err) => {
-      log('readableWebSocketStream pipeTo error', err)
-    })
+      log('readableWebSocketStream pipeTo error', err);
+      safeCloseWebSocket(socket);
+    });
 
-  return response
+  return response;
 }
 
-// تحسين: تحسين وظيفة handleTCPOutBound لزيادة السرعة
 async function handleTCPOutBound(
   remoteSocket: { value: any },
   addressRemote: string,
@@ -482,84 +487,92 @@ async function handleTCPOutBound(
   vlessResponseHeader: Uint8Array,
   log: (info: string, event?: string) => void
 ) {
-  // تحسين: استخدام اتصالات TCP أكثر كفاءة
-  const connectOptions = {
-    port: portRemote,
-    hostname: proxyIP || addressRemote,
-    transport: "tcp",
-  };
+  let retries = 0;
+  
+  async function connectAndWrite(address: string, port: number) {
+    try {
+      const tcpSocket = await Deno.connect({
+        port: port,
+        hostname: address,
+        transport: 'tcp',
+      });
+
+      // Enable TCP keepalive
+      const keepalive = Deno.setRaw(tcpSocket.rid, {
+        tcpKeepalive: true,
+        tcpKeepaliveInterval: TCP_KEEPALIVE_INTERVAL,
+      });
+
+      if (!keepalive) {
+        log('Failed to enable TCP keepalive');
+      }
+
+      remoteSocket.value = tcpSocket;
+      log(`connected to ${address}:${port}`);
+      const writer = tcpSocket.writable.getWriter();
+      await writer.write(new Uint8Array(rawClientData));
+      writer.releaseLock();
+      return tcpSocket;
+    } catch (error) {
+      log(`Connection error to ${address}:${port}`, error.message);
+      throw error;
+    }
+  }
+
+  async function retry() {
+    if (retries >= MAX_RETRIES) {
+      log(`Max retries (${MAX_RETRIES}) reached`);
+      safeCloseWebSocket(webSocket);
+      return;
+    }
+    
+    retries++;
+    log(`Retrying connection (${retries}/${MAX_RETRIES})...`);
+    
+    try {
+      await new Promise(resolve => setTimeout(resolve, RETRY_DELAY * retries));
+      const tcpSocket = await connectAndWrite(proxyIP || addressRemote, portRemote);
+      remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, null, log);
+    } catch (error) {
+      if (retries < MAX_RETRIES) {
+        await retry();
+      } else {
+        log(`Failed after ${MAX_RETRIES} retries`);
+        safeCloseWebSocket(webSocket);
+      }
+    }
+  }
 
   try {
-    const tcpSocket = await Deno.connect(connectOptions);
-    remoteSocket.value = tcpSocket;
-    log(`connected to ${addressRemote}:${portRemote}`);
-    
-    // تحسين: كتابة البيانات بدون تأخير
-    const writer = tcpSocket.writable.getWriter();
-    await writer.write(rawClientData);
-    writer.releaseLock();
-    
-    // تحسين: إدارة أفضل لتدفق البيانات
-    remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, null, log);
+    const tcpSocket = await connectAndWrite(addressRemote, portRemote);
+    remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, retry, log);
   } catch (error) {
-    log(`TCP connection error: ${error}`);
     if (proxyIP) {
-      // Retry with direct connection if proxy fails
-      const tcpSocket = await Deno.connect({
-        port: portRemote,
-        hostname: addressRemote,
-      });
-      remoteSocket.value = tcpSocket;
-      log(`connected directly to ${addressRemote}:${portRemote} after proxy failure`);
-      
-      const writer = tcpSocket.writable.getWriter();
-      await writer.write(rawClientData);
-      writer.releaseLock();
-      
-      remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, null, log);
+      await retry();
     } else {
-      throw error;
+      log('Initial connection failed and no proxy IP configured');
+      safeCloseWebSocket(webSocket);
     }
   }
 }
 
-// تحسين: تحسين وظيفة makeReadableWebSocketStream
 function makeReadableWebSocketStream(webSocketServer: WebSocket, earlyDataHeader: string, log: (info: string, event?: string) => void) {
   let readableStreamCancel = false;
-  
-  // تحسين: استخدام queue لمعالجة البيانات بكفاءة
-  const queue: any[] = [];
-  let controller: ReadableStreamDefaultController;
-  
-  const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
-  if (earlyData) {
-    queue.push(earlyData);
-  }
-
   const stream = new ReadableStream({
-    start(c) {
-      controller = c;
-      
-      // معالجة البيانات المتبقية في الطابور
-      while (queue.length > 0 && !readableStreamCancel) {
-        controller.enqueue(queue.shift());
-      }
-      
+    start(controller) {
       webSocketServer.addEventListener('message', (event) => {
-        if (readableStreamCancel) return;
-        
-        // تحسين: تقليل عمليات النسخ للبيانات
-        const message = event.data;
-        if (controller.desiredSize && controller.desiredSize > 0) {
-          controller.enqueue(message);
-        } else {
-          queue.push(message);
+        if (readableStreamCancel) {
+          return;
         }
+        const message = event.data;
+        controller.enqueue(message);
       });
 
       webSocketServer.addEventListener('close', () => {
         safeCloseWebSocket(webSocketServer);
-        if (readableStreamCancel) return;
+        if (readableStreamCancel) {
+          return;
+        }
         controller.close();
       });
       
@@ -567,17 +580,21 @@ function makeReadableWebSocketStream(webSocketServer: WebSocket, earlyDataHeader
         log('webSocketServer has error');
         controller.error(err);
       });
-    },
-
-    pull() {
-      // معالجة البيانات المتبقية في الطابور
-      while (queue.length > 0 && !readableStreamCancel) {
-        controller.enqueue(queue.shift());
+      
+      const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
+      if (error) {
+        controller.error(error);
+      } else if (earlyData) {
+        controller.enqueue(earlyData);
       }
     },
 
+    pull(controller) {},
+
     cancel(reason) {
-      if (readableStreamCancel) return;
+      if (readableStreamCancel) {
+        return;
+      }
       log(`ReadableStream was canceled, due to ${reason}`);
       readableStreamCancel = true;
       safeCloseWebSocket(webSocketServer);
@@ -587,25 +604,19 @@ function makeReadableWebSocketStream(webSocketServer: WebSocket, earlyDataHeader
   return stream;
 }
 
-// تحسين: تحسين وظيفة processVlessHeader
-function processVlessHeader(vlessBuffer: Uint8Array, userID: string) {
-  if (vlessBuffer.length < 24) {
+function processVlessHeader(vlessBuffer: ArrayBuffer, userID: string) {
+  if (vlessBuffer.byteLength < 24) {
     return {
       hasError: true,
       message: 'invalid data',
     };
   }
-  
-  // تحسين: استخدام Uint8Array مباشرة لتقليل عمليات النسخ
-  const version = vlessBuffer.subarray(0, 1);
+  const version = new Uint8Array(vlessBuffer.slice(0, 1));
   let isValidUser = false;
   let isUDP = false;
-  
-  // تحسين: مقارنة مباشرة للـ UUID
-  const userIDBytes = new TextEncoder().encode(userID);
-  const bufferUUID = vlessBuffer.subarray(1, 17);
-  isValidUser = userIDBytes.every((val, idx) => val === bufferUUID[idx]);
-  
+  if (stringify(new Uint8Array(vlessBuffer.slice(1, 17))) === userID) {
+    isValidUser = true;
+  }
   if (!isValidUser) {
     return {
       hasError: true,
@@ -613,11 +624,10 @@ function processVlessHeader(vlessBuffer: Uint8Array, userID: string) {
     };
   }
 
-  const optLength = vlessBuffer[17];
-  const command = vlessBuffer[18 + optLength];
+  const optLength = new Uint8Array(vlessBuffer.slice(17, 18))[0];
+  const command = new Uint8Array(vlessBuffer.slice(18 + optLength, 18 + optLength + 1))[0];
 
   if (command === 1) {
-    // TCP
   } else if (command === 2) {
     isUDP = true;
   } else {
@@ -626,31 +636,30 @@ function processVlessHeader(vlessBuffer: Uint8Array, userID: string) {
       message: `command ${command} is not support, command 01-tcp,02-udp,03-mux`,
     };
   }
-  
   const portIndex = 18 + optLength + 1;
-  const portRemote = new DataView(vlessBuffer.buffer).getUint16(portIndex);
+  const portBuffer = vlessBuffer.slice(portIndex, portIndex + 2);
+  const portRemote = new DataView(portBuffer).getUint16(0);
 
   let addressIndex = portIndex + 2;
-  const addressType = vlessBuffer[addressIndex];
-  
+  const addressBuffer = new Uint8Array(vlessBuffer.slice(addressIndex, addressIndex + 1));
+
+  const addressType = addressBuffer[0];
   let addressLength = 0;
   let addressValueIndex = addressIndex + 1;
   let addressValue = '';
-  
-  // تحسين: معالجة أنواع العناوين بكفاءة
   switch (addressType) {
-    case 1: // IPv4
+    case 1:
       addressLength = 4;
-      addressValue = Array.from(vlessBuffer.subarray(addressValueIndex, addressValueIndex + addressLength)).join('.');
+      addressValue = new Uint8Array(vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength)).join('.');
       break;
-    case 2: // Domain
-      addressLength = vlessBuffer[addressValueIndex];
+    case 2:
+      addressLength = new Uint8Array(vlessBuffer.slice(addressValueIndex, addressValueIndex + 1))[0];
       addressValueIndex += 1;
-      addressValue = new TextDecoder().decode(vlessBuffer.subarray(addressValueIndex, addressValueIndex + addressLength));
+      addressValue = new TextDecoder().decode(vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength));
       break;
-    case 3: // IPv6
+    case 3:
       addressLength = 16;
-      const dataView = new DataView(vlessBuffer.buffer, addressValueIndex, addressLength);
+      const dataView = new DataView(vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength));
       const ipv6: string[] = [];
       for (let i = 0; i < 8; i++) {
         ipv6.push(dataView.getUint16(i * 2).toString(16));
@@ -660,10 +669,9 @@ function processVlessHeader(vlessBuffer: Uint8Array, userID: string) {
     default:
       return {
         hasError: true,
-        message: `invalid addressType is ${addressType}`,
+        message: `invild  addressType is ${addressType}`,
       };
   }
-
   if (!addressValue) {
     return {
       hasError: true,
@@ -682,67 +690,55 @@ function processVlessHeader(vlessBuffer: Uint8Array, userID: string) {
   };
 }
 
-// تحسين: تحسين وظيفة remoteSocketToWS
 async function remoteSocketToWS(remoteSocket: Deno.TcpConn, webSocket: WebSocket, vlessResponseHeader: Uint8Array, retry: (() => Promise<void>) | null, log: (info: string, event?: string) => void) {
   let remoteChunkCount = 0;
   let hasIncomingData = false;
   
-  // تحسين: استخدام TransformStream لتحسين تدفق البيانات
-  const transformStream = new TransformStream({
-    async transform(chunk, controller) {
-      hasIncomingData = true;
-      remoteChunkCount++;
-      
-      if (webSocket.readyState !== WS_READY_STATE_OPEN) {
-        controller.error('webSocket.readyState is not open, maybe close');
-        return;
-      }
-
-      if (vlessResponseHeader) {
-        // تحسين: تقليل عمليات النسخ للبيانات
-        const combined = new Uint8Array(vlessResponseHeader.length + chunk.length);
-        combined.set(vlessResponseHeader);
-        combined.set(chunk, vlessResponseHeader.length);
-        controller.enqueue(combined);
-        vlessResponseHeader = null;
-      } else {
-        controller.enqueue(chunk);
-      }
-    },
-    close() {
-      log(`remoteConnection!.readable is close with hasIncomingData is ${hasIncomingData}`);
-    },
-    abort(reason) {
-      console.error(`remoteConnection!.readable abort`, reason);
-    },
-  });
-
   try {
     await remoteSocket.readable
-      .pipeThrough(transformStream)
       .pipeTo(
         new WritableStream({
-          write(chunk) {
-            if (webSocket.readyState === WS_READY_STATE_OPEN) {
+          start() {},
+          async write(chunk, controller) {
+            hasIncomingData = true;
+            if (webSocket.readyState !== WS_READY_STATE_OPEN) {
+              controller.error('webSocket.readyState is not open, maybe close');
+              return;
+            }
+
+            if (vlessResponseHeader) {
+              webSocket.send(new Uint8Array([...vlessResponseHeader, ...chunk]));
+              vlessResponseHeader = null;
+            } else {
               webSocket.send(chunk);
+            }
+            remoteChunkCount++;
+            
+            // Log performance every 100 chunks
+            if (remoteChunkCount % 100 === 0) {
+              log(`Processed ${remoteChunkCount} chunks`);
             }
           },
           close() {
-            log(`remoteSocketToWS: writable stream closed`);
+            log(`remoteConnection!.readable is close with hasIncomingData is ${hasIncomingData}`);
           },
           abort(reason) {
-            log(`remoteSocketToWS: writable stream aborted`, reason);
+            log(`remoteConnection!.readable abort`, reason);
           },
         })
-      );
-  } catch (error) {
-    console.error(`remoteSocketToWS has exception `, error.stack || error);
-    safeCloseWebSocket(webSocket);
-  }
+      )
+      .catch((error) => {
+        log(`remoteSocketToWS has exception`, error.stack || error);
+        safeCloseWebSocket(webSocket);
+      });
 
-  if (hasIncomingData === false && retry) {
-    log(`retry`);
-    await retry();
+    if (hasIncomingData === false && retry) {
+      log(`retry`);
+      await retry();
+    }
+  } catch (error) {
+    log(`remoteSocketToWS error`, error.message);
+    safeCloseWebSocket(webSocket);
   }
 }
 
@@ -751,21 +747,18 @@ function base64ToArrayBuffer(base64Str: string) {
     return { error: null };
   }
   try {
-    // تحسين: استخدام تعبيرات منتظمة أكثر كفاءة
-    const decoded = atob(base64Str.replace(/[-_]/g, m => m === '-' ? '+' : '/'));
-    const arryBuffer = new Uint8Array(decoded.length);
-    for (let i = 0; i < decoded.length; i++) {
-      arryBuffer[i] = decoded.charCodeAt(i);
-    }
+    base64Str = base64Str.replace(/-/g, '+').replace(/_/g, '/');
+    const decode = atob(base64Str);
+    const arryBuffer = Uint8Array.from(decode, (c) => c.charCodeAt(0));
     return { earlyData: arryBuffer.buffer, error: null };
   } catch (error) {
-    return { error };
+    return { error: error };
   }
 }
 
 function isValidUUID(uuid: string): boolean {
-  // تحسين: استخدام تعبير منتظم أكثر كفاءة
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(uuid);
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[4][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  return uuidRegex.test(uuid);
 }
 
 const WS_READY_STATE_OPEN = 1;
@@ -780,58 +773,84 @@ function safeCloseWebSocket(socket: WebSocket) {
   }
 }
 
-// تحسين: تحسين وظيفة handleUDPOutBound لاستعلامات DNS الأسرع
+const byteToHex: string[] = [];
+for (let i = 0; i < 256; ++i) {
+  byteToHex.push((i + 256).toString(16).slice(1));
+}
+function unsafeStringify(arr: Uint8Array, offset = 0) {
+  return (
+    byteToHex[arr[offset + 0]] +
+    byteToHex[arr[offset + 1]] +
+    byteToHex[arr[offset + 2]] +
+    byteToHex[arr[offset + 3]] +
+    '-' +
+    byteToHex[arr[offset + 4]] +
+    byteToHex[arr[offset + 5]] +
+    '-' +
+    byteToHex[arr[offset + 6]] +
+    byteToHex[arr[offset + 7]] +
+    '-' +
+    byteToHex[arr[offset + 8]] +
+    byteToHex[arr[offset + 9]] +
+    '-' +
+    byteToHex[arr[offset + 10]] +
+    byteToHex[arr[offset + 11]] +
+    byteToHex[arr[offset + 12]] +
+    byteToHex[arr[offset + 13]] +
+    byteToHex[arr[offset + 14]] +
+    byteToHex[arr[offset + 15]]
+  ).toLowerCase();
+}
+function stringify(arr: Uint8Array, offset = 0) {
+  const uuid = unsafeStringify(arr, offset);
+  if (!isValidUUID(uuid)) {
+    throw TypeError('Stringified UUID is invalid');
+  }
+  return uuid;
+}
+
 async function handleUDPOutBound(webSocket: WebSocket, vlessResponseHeader: Uint8Array, log: (info: string) => void) {
   let isVlessHeaderSent = false;
-  
-  // تحسين: استخدام TransformStream لمعالجة حزم UDP بكفاءة
   const transformStream = new TransformStream({
+    start(controller) {},
     transform(chunk, controller) {
-      // تحسين: معالجة حزم UDP بدون نسخ البيانات غير الضرورية
-      const chunkView = new Uint8Array(chunk);
-      for (let index = 0; index < chunkView.length;) {
-        const udpPakcetLength = new DataView(chunkView.buffer).getUint16(index);
-        const udpData = chunkView.subarray(index + 2, index + 2 + udpPakcetLength);
-        index += 2 + udpPakcetLength;
+      for (let index = 0; index < chunk.byteLength;) {
+        const lengthBuffer = chunk.slice(index, index + 2);
+        const udpPakcetLength = new DataView(lengthBuffer).getUint16(0);
+        const udpData = new Uint8Array(chunk.slice(index + 2, index + 2 + udpPakcetLength));
+        index = index + 2 + udpPakcetLength;
         controller.enqueue(udpData);
       }
     },
+    flush(controller) {},
   });
 
-  // تحسين: معالجة استعلامات DNS بشكل متوازي
   transformStream.readable
     .pipeTo(
       new WritableStream({
         async write(chunk) {
           try {
-            // تحسين: استخدام fetch مع إعدادات أفضل
             const resp = await fetch('https://1.1.1.1/dns-query', {
               method: 'POST',
               headers: {
                 'content-type': 'application/dns-message',
-                'accept': 'application/dns-message',
               },
               body: chunk,
             });
-            
             const dnsQueryResult = await resp.arrayBuffer();
             const udpSize = dnsQueryResult.byteLength;
             const udpSizeBuffer = new Uint8Array([(udpSize >> 8) & 0xff, udpSize & 0xff]);
-            
             if (webSocket.readyState === WS_READY_STATE_OPEN) {
               log(`doh success and dns message length is ${udpSize}`);
-              
-              // تحسين: تقليل عمليات النسخ للبيانات
-              const responseData = isVlessHeaderSent
-                ? [udpSizeBuffer, dnsQueryResult]
-                : [vlessResponseHeader, udpSizeBuffer, dnsQueryResult];
-              
-              const blob = new Blob(responseData);
-              webSocket.send(await blob.arrayBuffer());
-              isVlessHeaderSent = true;
+              if (isVlessHeaderSent) {
+                webSocket.send(await new Blob([udpSizeBuffer, dnsQueryResult]).arrayBuffer());
+              } else {
+                webSocket.send(await new Blob([vlessResponseHeader, udpSizeBuffer, dnsQueryResult]).arrayBuffer());
+                isVlessHeaderSent = true;
+              }
             }
           } catch (error) {
-            log('DNS query failed: ' + error);
+            log(`DNS query error: ${error.message}`);
           }
         },
       })
